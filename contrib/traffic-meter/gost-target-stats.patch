@@ -1,0 +1,370 @@
+--- a/handler/socks/v5/metadata.go
++++ b/handler/socks/v5/metadata.go
+@@ -14,6 +14,7 @@
+ )
+ 
+ type metadata struct {
++	targetStats    bool
+ 	recorderPeriod time.Duration // reports a live session on this interval; 0 = one record per session, written when it ends.
+ 
+ 	publicAddr string
+@@ -55,6 +56,7 @@
+ }
+ 
+ func (h *socks5Handler) parseMetadata(md mdata.Metadata) (err error) {
++	h.md.targetStats = mdutil.GetBool(md, "recorder.targetStats")
+ 	h.md.recorderPeriod = mdutil.GetDuration(md, "recorder.period", "recorder.reportPeriod")
+ 
+ 	h.md.publicAddr = mdutil.GetString(md, "socks.publicAddr", "publicAddr")
+--- a/handler/socks/v5/handler.go
++++ b/handler/socks/v5/handler.go
+@@ -4,6 +4,7 @@
+ 	"context"
+ 	"errors"
+ 	"net"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/go-gost/core/handler"
+@@ -37,6 +38,10 @@
+ }
+ 
+ type socks5Handler struct {
++	targetMu        sync.Mutex
++	targetClosing   bool
++	targetConns     map[net.Conn]struct{}
++	targetWG        sync.WaitGroup
+ 	selector        gosocks5.Selector
+ 	md              metadata
+ 	options         handler.Options
+@@ -95,6 +100,9 @@
+ 		}
+ 	}
+ 
++	if h.md.targetStats && (h.md.recorderPeriod <= 0 || h.recorder.Recorder == nil || h.md.sniffing) {
++		return errors.New("逐目标计量要求周期记录器，且关闭内容嗅探")
++	}
+ 	h.sessionRecorder = xrecorder.NewSessionRecorder(h.recorder.Recorder, xrecorder.SessionRecorderOptions{
+ 		Period: h.md.recorderPeriod,
+ 	})
+@@ -128,6 +136,25 @@
+ 
+ func (h *socks5Handler) Handle(ctx context.Context, conn net.Conn, opts ...handler.HandleOption) (err error) {
+ 	defer conn.Close()
++	if h.md.targetStats {
++		h.targetMu.Lock()
++		if h.targetClosing {
++			h.targetMu.Unlock()
++			return net.ErrClosed
++		}
++		if h.targetConns == nil {
++			h.targetConns = map[net.Conn]struct{}{}
++		}
++		h.targetConns[conn] = struct{}{}
++		h.targetWG.Add(1)
++		h.targetMu.Unlock()
++		defer func(original net.Conn) {
++			h.targetMu.Lock()
++			delete(h.targetConns, original)
++			h.targetMu.Unlock()
++			h.targetWG.Done()
++		}(conn)
++	}
+ 
+ 	start := time.Now()
+ 
+@@ -201,6 +228,9 @@
+ 	conn = sc
+ 	conn.SetReadDeadline(time.Time{})
+ 
++	if h.md.targetStats {
++		ro.RecordMode = "off"
++	}
+ 	address := req.Addr.String()
+ 	ro.Host = address
+ 
+@@ -232,6 +262,20 @@
+ }
+ 
+ func (h *socks5Handler) Close() error {
++	// 先结束在途连接并完成最终计数，再关闭周期记录器。
++	if h.md.targetStats {
++		h.targetMu.Lock()
++		h.targetClosing = true
++		conns := make([]net.Conn, 0, len(h.targetConns))
++		for c := range h.targetConns {
++			conns = append(conns, c)
++		}
++		h.targetMu.Unlock()
++		for _, c := range conns {
++			_ = c.Close()
++		}
++		h.targetWG.Wait()
++	}
+ 	if h.cancel != nil {
+ 		h.cancel()
+ 	}
+--- a/handler/socks/v5/connect.go
++++ b/handler/socks/v5/connect.go
+@@ -92,6 +92,11 @@
+ 		return err
+ 	}
+ 
++	if h.md.targetStats {
++		meter := h.targetMeter(ctx, *ro, "tcp", address)
++		cc = &payloadConn{Conn: cc, meter: meter}
++		defer meter.finish(ctx)
++	}
+ 	if h.md.sniffing {
+ 		if h.md.sniffingTimeout > 0 {
+ 			conn.SetReadDeadline(time.Now().Add(h.md.sniffingTimeout))
+--- a/handler/socks/v5/udp.go
++++ b/handler/socks/v5/udp.go
+@@ -130,6 +130,9 @@
+ 	}
+ 
+ 	log.Debugf("bind on %s OK", cc.LocalAddr())
++	if h.md.targetStats {
++		pc = &targetPacketConn{PacketConn: pc, handler: h, ctx: ctx, base: *ro, meters: map[string]*targetMeter{}, reverse: map[string]map[string]bool{}}
++	}
+ 	pc = metrics.WrapPacketConn(ro.Service, pc)
+ 
+ 	{
+@@ -188,11 +191,17 @@
+ 		WithBufferSize(h.md.udpBufferSize).
+ 		WithLogger(log)
+ 
+-	go r.Run(ctx)
++	done := make(chan struct{})
++	go func() { defer close(done); _ = r.Run(ctx) }()
+ 
+ 	t := time.Now()
+ 	log.Debugf("%s <-> %s", conn.RemoteAddr(), cc.LocalAddr())
+ 	io.Copy(io.Discard, conn)
++	if h.md.targetStats {
++		_ = pc1.Close()
++		_ = pc.Close()
++		<-done
++	}
+ 	log.WithFields(map[string]any{"duration": time.Since(t)}).
+ 		Debugf("%s >-< %s", conn.RemoteAddr(), cc.LocalAddr())
+ 
+@@ -270,12 +279,19 @@
+ }
+ 
+ func (c *resolvePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
++	resolved, err := c.resolveAddress(addr)
++	if err != nil {
++		return 0, err
++	}
++	return c.PacketConn.WriteTo(b, resolved)
++}
++func (c *resolvePacketConn) resolveAddress(addr net.Addr) (net.Addr, error) {
+ 	host, portStr, err := net.SplitHostPort(addr.String())
+ 	if err != nil {
+-		return c.PacketConn.WriteTo(b, addr)
++		return addr, nil
+ 	}
+ 	if net.ParseIP(host) != nil {
+-		return c.PacketConn.WriteTo(b, addr)
++		return addr, nil
+ 	}
+ 
+ 	var ips []net.IP
+@@ -289,7 +305,7 @@
+ 		ips, _ = net.LookupIP(host)
+ 	}
+ 	if len(ips) == 0 {
+-		return 0, fmt.Errorf("socks5 udp: cannot resolve %s", host)
++		return nil, fmt.Errorf("socks5 udp: cannot resolve %s", host)
+ 	}
+ 
+ 	ip := ips[0]
+@@ -300,7 +316,7 @@
+ 		}
+ 	}
+ 	port, _ := strconv.Atoi(portStr)
+-	return c.PacketConn.WriteTo(b, &net.UDPAddr{IP: ip, Port: port})
++	return &net.UDPAddr{IP: ip, Port: port}, nil
+ }
+ 
+ // domainResolvePacketConn wraps a net.PacketConn and resolves domain
+--- a/handler/socks/v5/target_stats.go
++++ b/handler/socks/v5/target_stats.go
+@@ -0,0 +1,176 @@
++package v5
++
++import (
++	"context"
++	"net"
++	"sync"
++	"time"
++
++	"github.com/go-gost/core/observer/stats"
++	xstats "github.com/go-gost/x/observer/stats"
++	xrecorder "github.com/go-gost/x/recorder"
++)
++
++type targetMeter struct {
++	counters xstats.Stats
++	session  *xrecorder.Session
++	base     xrecorder.HandlerRecorderObject
++}
++
++func (h *socks5Handler) targetMeter(ctx context.Context, base xrecorder.HandlerRecorderObject, network, host string) *targetMeter {
++	base.Network, base.Host, base.Time, base.RecordMode = network, host, time.Now(), ""
++	base.HTTP, base.TLS, base.DNS, base.Websocket, base.Redis = nil, nil, nil, nil, nil
++	base.InputBytes, base.OutputBytes = 0, 0
++	base.Labels = map[string]string{"meter": "target-v1"}
++	m := &targetMeter{base: base}
++	m.session = h.sessionRecorder.NewSession(ctx, &m.counters)
++	m.session.Start(base)
++	return m
++}
++
++func (m *targetMeter) finish(ctx context.Context) {
++	base := m.base
++	base.InputBytes = m.counters.Get(stats.KindInputBytes)
++	base.OutputBytes = m.counters.Get(stats.KindOutputBytes)
++	_ = m.session.Finish(ctx, base)
++}
++
++type payloadConn struct {
++	net.Conn
++	meter *targetMeter
++}
++
++func (c *payloadConn) Read(p []byte) (int, error) {
++	n, e := c.Conn.Read(p)
++	c.meter.counters.Add(stats.KindOutputBytes, int64(n))
++	return n, e
++}
++func (c *payloadConn) Write(p []byte) (int, error) {
++	n, e := c.Conn.Write(p)
++	c.meter.counters.Add(stats.KindInputBytes, int64(n))
++	return n, e
++}
++func (c *payloadConn) CloseWrite() error {
++	if v, ok := c.Conn.(interface{ CloseWrite() error }); ok {
++		return v.CloseWrite()
++	}
++	return nil
++}
++func (c *payloadConn) CloseRead() error {
++	if v, ok := c.Conn.(interface{ CloseRead() error }); ok {
++		return v.CloseRead()
++	}
++	return nil
++}
++
++type targetPacketConn struct {
++	net.PacketConn
++	handler  *socks5Handler
++	ctx      context.Context
++	base     xrecorder.HandlerRecorderObject
++	mu       sync.Mutex
++	active   sync.WaitGroup
++	closing  bool
++	once     sync.Once
++	meters   map[string]*targetMeter
++	reverse  map[string]map[string]bool
++	resolved map[string]net.Addr
++}
++
++func (c *targetPacketConn) enter() bool {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.closing {
++		return false
++	}
++	c.active.Add(1)
++	return true
++}
++func (c *targetPacketConn) meter(host string) *targetMeter {
++	m := c.meters[host]
++	if m == nil {
++		m = c.handler.targetMeter(c.ctx, c.base, "udp", host)
++		c.meters[host] = m
++	}
++	return m
++}
++func (c *targetPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
++	if !c.enter() {
++		return 0, net.ErrClosed
++	}
++	defer c.active.Done()
++	original := addr.String()
++	resolved := addr
++	destination := c.PacketConn
++	if r, ok := c.PacketConn.(*resolvePacketConn); ok {
++		c.mu.Lock()
++		cached := c.resolved[original]
++		c.mu.Unlock()
++		if cached != nil {
++			resolved = cached
++		} else {
++			var err error
++			resolved, err = r.resolveAddress(addr)
++			if err != nil {
++				return 0, err
++			}
++			c.mu.Lock()
++			if c.resolved == nil {
++				c.resolved = map[string]net.Addr{}
++			}
++			c.resolved[original] = resolved
++			c.mu.Unlock()
++		}
++		destination = r.PacketConn
++	}
++	// 发送前建立回包映射；同一地址对应多个域名时，下载按地址保留，避免猜测归属。
++	c.mu.Lock()
++	names := c.reverse[resolved.String()]
++	if names == nil {
++		names = map[string]bool{}
++		c.reverse[resolved.String()] = names
++	}
++	names[original] = true
++	m := c.meter(original)
++	c.mu.Unlock()
++	n, e := destination.WriteTo(p, resolved)
++	m.counters.Add(stats.KindInputBytes, int64(n))
++	return n, e
++}
++func (c *targetPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	if !c.enter() {
++		return 0, nil, net.ErrClosed
++	}
++	defer c.active.Done()
++	n, addr, e := c.PacketConn.ReadFrom(p)
++	if n > 0 && addr != nil {
++		c.mu.Lock()
++		host := addr.String()
++		names := c.reverse[host]
++		if len(names) == 1 {
++			for name := range names {
++				host = name
++			}
++		}
++		m := c.meter(host)
++		c.mu.Unlock()
++		m.counters.Add(stats.KindOutputBytes, int64(n))
++	}
++	return n, addr, e
++}
++func (c *targetPacketConn) Close() error {
++	var err error
++	c.once.Do(func() {
++		c.mu.Lock()
++		c.closing = true
++		c.mu.Unlock()
++		err = c.PacketConn.Close()
++		c.active.Wait()
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		for _, m := range c.meters {
++			m.finish(c.ctx)
++		}
++	})
++	return err
++}

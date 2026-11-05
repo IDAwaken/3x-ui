@@ -47,6 +47,7 @@ func (a *ServerController) initRouter(g *gin.RouterGroup) {
 	g.GET("/status", a.status)
 	g.GET("/cpuHistory/:bucket", a.getCpuHistoryBucket)
 	g.GET("/history/:metric/:bucket", a.getMetricHistoryBucket)
+	g.GET("/siteTraffic/:bucket", a.getSiteTrafficHistory)
 	g.GET("/xrayMetricsState", a.getXrayMetricsState)
 	g.GET("/xrayMetricsHistory/:metric/:bucket", a.getXrayMetricsHistoryBucket)
 	g.GET("/xrayObservatory", a.getXrayObservatory)

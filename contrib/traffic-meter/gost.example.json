@@ -1,0 +1,45 @@
+{
+  "services": [
+    {
+      "name": "proxy-meter",
+      "addr": "127.0.0.1:13080",
+      "handler": {
+        "type": "socks5",
+        "metadata": {
+          "udp": true,
+          "recorder.period": "30s",
+          "recorder.targetStats": true,
+          "sniffing": false
+        }
+      },
+      "listener": {
+        "type": "tcp"
+      },
+      "recorders": [
+        {
+          "name": "sessions",
+          "record": "recorder.service.handler"
+        }
+      ]
+    }
+  ],
+  "recorders": [
+    {
+      "name": "sessions",
+      "file": {
+        "path": "/var/lib/3x-ui-meter/sessions.jsonl",
+        "sep": "\n",
+        "rotation": {
+          "maxSize": 10,
+          "maxAge": 3,
+          "maxBackups": 5
+        }
+      }
+    }
+  ],
+  "log": {
+    "level": "error",
+    "format": "json",
+    "output": "stderr"
+  }
+}

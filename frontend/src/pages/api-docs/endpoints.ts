@@ -468,6 +468,19 @@ export const sections: readonly Section[] = [
       },
       {
         method: 'GET',
+        path: '/panel/api/server/siteTraffic/:bucket',
+        summary: '按时间范围查询网站上传、下载、排行及趋势。统计使用北京时间，保存粒度为小时。',
+        params: [
+          {
+            name: 'bucket',
+            in: 'path',
+            type: 'number',
+            desc: '每点秒数，乘六十为范围秒数：1440 为一天，2880 为两天，10080 为七天，43200 为三十天。',
+          },
+        ],
+      },
+      {
+        method: 'GET',
         path: '/panel/api/server/cpuHistory/:bucket',
         summary:
           'Legacy: aggregated CPU history. Use /history/cpu/:bucket instead — same data with a uniform {t, v} shape.',

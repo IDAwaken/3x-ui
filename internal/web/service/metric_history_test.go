@@ -105,7 +105,8 @@ func TestSeriesPickTierBySpan(t *testing.T) {
 		{7200, 60},
 		{172800, 60},
 		{604800, 600},
-		{9999999, 600},
+		{2592000, 3600},
+		{9999999, 3600},
 	}
 	for _, c := range cases {
 		if got := s.pickTier(c.span); got.resolution != c.res {

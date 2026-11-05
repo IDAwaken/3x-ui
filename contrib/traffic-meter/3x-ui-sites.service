@@ -1,0 +1,10 @@
+[Unit]
+Description=全量目标流量增量入库
+After=gost-meter.service x-ui.service
+
+[Service]
+Type=oneshot
+UMask=0077
+Nice=10
+ExecCondition=/usr/bin/systemctl is-active --quiet gost-meter.service
+ExecStart=/usr/local/libexec/3x-ui-traffic-ingest

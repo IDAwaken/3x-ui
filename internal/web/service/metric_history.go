@@ -34,6 +34,7 @@ var metricTiers = []tierSpec{
 	{resolution: 2, capacity: 1800},   // 1h at 2s
 	{resolution: 60, capacity: 2880},  // 48h at 1m
 	{resolution: 600, capacity: 1008}, // 7d at 10m
+	{resolution: 3600, capacity: 720}, // 过去三十天，每小时保存一个均值
 }
 
 // tierBuf is one fixed-resolution ring of a series. Samples land in an open
@@ -264,6 +265,13 @@ func (h *metricHistory) restore(data map[string]persistedSeries) {
 				}
 				tb.samples = samples
 				break
+			}
+		}
+		// 新增的月度层从已有七天层初始化，保留升级前仍可用的历史。
+		archive := s.tiers[len(s.tiers)-1]
+		if len(archive.samples) == 0 {
+			for _, point := range s.tiers[len(s.tiers)-2].readSamples() {
+				archive.add(point.T, point.V)
 			}
 		}
 		h.series[k] = s

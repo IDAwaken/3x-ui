@@ -1,0 +1,25 @@
+[Unit]
+Description=逐目标流量计量转发
+After=network.target
+Before=x-ui.service
+
+[Service]
+Type=simple
+User=gost-meter
+Group=gost-meter
+UMask=0077
+Environment=GOMEMLIMIT=96MiB
+ExecStart=/usr/local/gost-meter/gost -C /etc/gost-meter/config.json
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/3x-ui-meter
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

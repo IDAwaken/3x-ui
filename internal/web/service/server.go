@@ -202,6 +202,7 @@ var allowedHistoryBuckets = map[int]bool{
 	1440:  true, // 24h
 	2880:  true, // 2d
 	10080: true, // 7d
+	43200: true, // 过去三十天
 }
 
 // IsAllowedHistoryBucket reports whether a bucket-seconds value is in the

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { Modal, Select, Tabs } from 'antd';
 import {
   ApiOutlined,
+  BarChartOutlined,
   DashboardOutlined,
   DatabaseOutlined,
   DeploymentUnitOutlined,
@@ -19,6 +20,7 @@ import { Sparkline } from '@/components/viz';
 import { useMediaQuery } from '@/hooks/useMediaQuery';
 import type { Status } from '@/models/status';
 import './SystemHistoryModal.css';
+import SiteTrafficHistory from './SiteTrafficHistory';
 
 interface SystemHistoryModalProps {
   open: boolean;
@@ -269,6 +271,7 @@ export default function SystemHistoryModal({ open, status, onClose }: SystemHist
   const [{ points, points2, points3, labels, timestamps }, setChart] =
     useState<HistoryChart>(EMPTY_CHART);
 
+  const isSites = activeKey === 'sites';
   const activeMetric = useMemo(() => METRICS.find((m) => m.key === activeKey), [activeKey]);
   const trName = (n?: string) => (n && n.startsWith('pages.') ? t(n) : n);
   const strokeColor = activeMetric?.stroke || status?.cpu?.color || '#008771';
@@ -293,12 +296,6 @@ export default function SystemHistoryModal({ open, status, onClose }: SystemHist
     [tsLookup],
   );
 
-  const fetchBucket = useCallback(async () => {
-    if (!activeMetric) return;
-    const next = await loadBucket(activeMetric, bucket);
-    setChart(next);
-  }, [activeMetric, bucket]);
-
   const [wasOpen, setWasOpen] = useState(false);
   if (open !== wasOpen) {
     setWasOpen(open);
@@ -308,26 +305,23 @@ export default function SystemHistoryModal({ open, status, onClose }: SystemHist
   useEffect(() => {
     if (!open || !activeMetric) return;
     let cancelled = false;
-    void (async () => {
+    const load = async () => {
       const next = await loadBucket(activeMetric, bucket);
       if (!cancelled) setChart(next);
-    })();
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), bucket <= 30 ? 2000 : 10000);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
   }, [open, activeMetric, bucket]);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    const ms = bucket <= 30 ? 2000 : 10000;
-    const id = window.setInterval(() => fetchBucket(), ms);
-    return () => window.clearInterval(id);
-  }, [open, bucket, fetchBucket]);
 
   return (
     <Modal
       open={open}
       footer={null}
+      styles={{ body: { maxHeight: '75vh', overflowY: 'auto' } }}
       width={isMobile ? '95vw' : 900}
       onCancel={onClose}
       title={
@@ -340,14 +334,19 @@ export default function SystemHistoryModal({ open, status, onClose }: SystemHist
             className="bucket-select"
             onChange={setBucket}
             options={[
-              { value: 2, label: '2m' },
-              { value: 60, label: '1h' },
-              { value: 180, label: '3h' },
-              { value: 360, label: '6h' },
-              { value: 720, label: '12h' },
+              ...(!isSites
+                ? [
+                    { value: 2, label: '2m' },
+                    { value: 60, label: '1h' },
+                    { value: 180, label: '3h' },
+                    { value: 360, label: '6h' },
+                    { value: 720, label: '12h' },
+                  ]
+                : []),
               { value: 1440, label: '24h' },
               { value: 2880, label: '2d' },
               { value: 10080, label: '7d' },
+              { value: 43200, label: '30d' },
             ]}
           />
         </div>
@@ -355,53 +354,75 @@ export default function SystemHistoryModal({ open, status, onClose }: SystemHist
     >
       <Tabs
         activeKey={activeKey}
-        onChange={setActiveKey}
+        onChange={(key) => {
+          setActiveKey(key);
+          // 日级范围跨标签保持一致；流量不支持的短范围才回退到三十天。
+          if (key === 'sites' && bucket < 1440) setBucket(43200);
+        }}
         size="small"
         className="history-tabs"
-        items={METRICS.map((m) => {
-          const tabLabel = m.tabKey ? t(m.tabKey) : m.tab;
-          return {
-            key: m.key,
+        items={[
+          ...METRICS.map((m) => {
+            const tabLabel = m.tabKey ? t(m.tabKey) : m.tab;
+            return {
+              key: m.key,
+              label: isMobile ? (
+                <span title={tabLabel} aria-label={tabLabel}>
+                  {m.icon}
+                </span>
+              ) : (
+                tabLabel
+              ),
+            };
+          }),
+          {
+            key: 'sites',
             label: isMobile ? (
-              <span title={tabLabel} aria-label={tabLabel}>
-                {m.icon}
+              <span title="流量" aria-label="流量">
+                <BarChartOutlined aria-hidden />
               </span>
             ) : (
-              tabLabel
+              '流量'
             ),
-          };
-        })}
+          },
+        ]}
       />
 
-      <div className="cpu-chart-wrap">
-        {activeMetric?.title && <div className="history-chart-title">{t(activeMetric.title)}</div>}
-        <Sparkline
-          data={points}
-          data2={activeMetric?.key2 ? points2 : undefined}
-          data3={activeMetric?.key3 ? points3 : undefined}
-          stroke2={activeMetric?.stroke2}
-          stroke3={activeMetric?.stroke3}
-          name1={trName(activeMetric?.name1)}
-          name2={trName(activeMetric?.name2)}
-          name3={trName(activeMetric?.name3)}
-          labels={labels}
-          height={260}
-          stroke={strokeColor}
-          strokeWidth={2.2}
-          showGrid
-          showAxes
-          tickCountX={5}
-          maxPoints={points.length || 1}
-          fillOpacity={0.18}
-          markerRadius={3.2}
-          showTooltip
-          valueMin={0}
-          valueMax={activeMetric?.valueMax ?? null}
-          yFormatter={yFormatter}
-          tooltipLabelFormatter={tooltipLabelFormatter}
-          extrema={{ show: !activeMetric?.key2, formatter: yFormatter }}
-        />
-      </div>
+      {isSites ? (
+        <SiteTrafficHistory bucket={bucket} />
+      ) : (
+        <div className="cpu-chart-wrap">
+          {activeMetric?.title && (
+            <div className="history-chart-title">{t(activeMetric.title)}</div>
+          )}
+          <Sparkline
+            data={points}
+            data2={activeMetric?.key2 ? points2 : undefined}
+            data3={activeMetric?.key3 ? points3 : undefined}
+            stroke2={activeMetric?.stroke2}
+            stroke3={activeMetric?.stroke3}
+            name1={trName(activeMetric?.name1)}
+            name2={trName(activeMetric?.name2)}
+            name3={trName(activeMetric?.name3)}
+            labels={labels}
+            height={260}
+            stroke={strokeColor}
+            strokeWidth={2.2}
+            showGrid
+            showAxes
+            tickCountX={5}
+            maxPoints={points.length || 1}
+            fillOpacity={0.18}
+            markerRadius={3.2}
+            showTooltip
+            valueMin={0}
+            valueMax={activeMetric?.valueMax ?? null}
+            yFormatter={yFormatter}
+            tooltipLabelFormatter={tooltipLabelFormatter}
+            extrema={{ show: !activeMetric?.key2, formatter: yFormatter }}
+          />
+        </div>
+      )}
     </Modal>
   );
 }
